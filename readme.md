@@ -31,8 +31,9 @@ $ create-dmg --help
     $ create-dmg <app> [destination]
 
   Options
-    --overwrite  Overwrite existing DMG with the same name
-    --format     Set DMG format (default ULFO)
+    --overwrite         Overwrite existing DMG with the same name
+    --identity=<value>  Manually set code signing identity (automatic by default)
+    --format            Set DMG format (default ULFO)
 
   Examples
     $ create-dmg 'Lungo.app'
@@ -47,6 +48,22 @@ The DMG requires macOS 10.11 or later with the default `format` and has the file
 It will try to code sign the DMG, but the DMG is still created and fine even if the code signing fails, for example if you don't have a developer certificate.
 
 <img src="screenshot-dmg.png" width="772">
+
+### DMG Icon
+
+[GraphicsMagick](http://www.graphicsmagick.org) is required to create the custom DMG icon that's based on the app icon and the macOS mounted device icon.
+
+#### Steps using Homebrew
+
+```
+$ brew install graphicsmagick imagemagick
+```
+
+#### Icon Example
+
+Original icon → DMG icon
+
+<img src="icon-example-app.png" width="300"><img src="icon-example.png" width="300">
 
 
 ## License
