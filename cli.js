@@ -1,13 +1,17 @@
 #!/usr/bin/env node
-'use strict';
-const path = require('path');
-const fs = require('fs');
-const meow = require('meow');
-const appdmg = require('appdmg');
-const plist = require('plist');
-const Ora = require('ora');
-const execa = require('execa');
-const composeIcon = require('./compose-icon');
+import process from 'node:process';
+import path from 'node:path';
+import fs from 'node:fs';
+import {fileURLToPath} from 'node:url';
+import meow from 'meow';
+import appdmg from 'appdmg';
+import plist from 'plist';
+import Ora from 'ora';
+import {execa} from 'execa';
+import addLicenseAgreementIfNeeded from './sla.js';
+import composeIcon from './compose-icon.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 if (process.platform !== 'darwin') {
 	console.error('macOS only');
@@ -19,42 +23,44 @@ const cli = meow(`
 	  $ create-dmg <app> [destination]
 
 	Options
-	  --overwrite         Overwrite existing DMG with the same name
-	  --identity=<value>  Manually set code signing identity (automatic by default)
-	  --format            Set DMG format (default ULFO)
+	  --overwrite          Overwrite existing DMG with the same name
+	  --identity=<value>   Manually set code signing identity (automatic by default)
+	  --dmg-title=<value>  Manually set DMG title (must be <=27 characters) [default: App name]
 
 	Examples
 	  $ create-dmg 'Lungo.app'
 	  $ create-dmg 'Lungo.app' Build/Releases
 `, {
+	importMeta: import.meta,
 	flags: {
 		overwrite: {
-			type: 'boolean'
+			type: 'boolean',
 		},
 		identity: {
-			type: 'string'
-		},
-		format: {
 			type: 'string',
-			default: 'ULFO'
-		}
-	}
+		},
+		dmgTitle: {
+			type: 'string',
+		},
+	},
 });
 
-let [appPath, destPath] = cli.input;
+let [appPath, destinationPath] = cli.input;
 
 if (!appPath) {
 	console.error('Specify an app');
 	process.exit(1);
 }
 
-if (!destPath) {
-	destPath = process.cwd();
+if (!destinationPath) {
+	destinationPath = process.cwd();
 }
+
+const infoPlistPath = path.join(appPath, 'Contents/Info.plist');
 
 let infoPlist;
 try {
-	infoPlist = fs.readFileSync(path.join(appPath, 'Contents/Info.plist'), 'utf8');
+	infoPlist = fs.readFileSync(infoPlistPath, 'utf8');
 } catch (error) {
 	if (error.code === 'ENOENT') {
 		console.error(`Could not find \`${path.relative(process.cwd(), appPath)}\``);
@@ -64,57 +70,84 @@ try {
 	throw error;
 }
 
-const appInfo = plist.parse(infoPlist);
-const appName = appInfo.CFBundleDisplayName || appInfo.CFBundleName;
-const appIconName = appInfo.CFBundleIconFile.replace(/\.icns/, '');
-const dmgPath = path.join(destPath, `${appName} ${appInfo.CFBundleShortVersionString}.dmg`);
-
 const ora = new Ora('Creating DMG');
 ora.start();
 
 async function init() {
+	let appInfo;
+	try {
+		appInfo = plist.parse(infoPlist);
+	} catch {
+		const {stdout} = await execa('/usr/bin/plutil', ['-convert', 'xml1', '-o', '-', infoPlistPath]);
+		appInfo = plist.parse(stdout);
+	}
+
+	const appName = appInfo.CFBundleDisplayName || appInfo.CFBundleName;
+	if (!appName) {
+		throw new Error('The app must have `CFBundleDisplayName` or `CFBundleName` defined in its `Info.plist`.');
+	}
+
+	const dmgTitle = cli.flags.dmgTitle || appName;
+	const dmgFilename = `${appName} ${appInfo.CFBundleShortVersionString}.dmg`;
+	const dmgPath = path.join(destinationPath, dmgFilename);
+
+	if (dmgTitle.length > 27) {
+		ora.fail('The disk image title cannot exceed 27 characters. This is a limitation in a dependency: https://github.com/LinusU/node-alias/issues/7');
+		process.exit(1);
+	}
+
 	if (cli.flags.overwrite) {
 		try {
 			fs.unlinkSync(dmgPath);
-		} catch (_) {}
+		} catch {}
 	}
 
-	ora.text = 'Creating icon';
-	const composedIconPath = await composeIcon(path.join(appPath, 'Contents/Resources', `${appIconName}.icns`));
+	const hasAppIcon = appInfo.CFBundleIconFile;
+	let composedIconPath;
+	if (hasAppIcon) {
+		ora.text = 'Creating icon';
+		const appIconName = appInfo.CFBundleIconFile.replace(/\.icns/, '');
+		composedIconPath = await composeIcon(path.join(appPath, 'Contents/Resources', `${appIconName}.icns`));
+	}
+
+	// Xcode 14+ only supports building apps for macOS 10.13+
+	const dmgFormat = 'ULFO'; // ULFO requires macOS 10.11+
+	const dmgFilesystem = 'HFS+';
 
 	const ee = appdmg({
 		target: dmgPath,
 		basepath: process.cwd(),
 		specification: {
-			title: appName,
+			title: dmgTitle,
 			icon: composedIconPath,
 			//
 			// Use transparent background and `background-color` option when this is fixed:
 			// https://github.com/LinusU/node-appdmg/issues/135
 			background: path.join(__dirname, 'assets/dmg-background.png'),
 			'icon-size': 160,
-			format: cli.flags.format,
+			format: dmgFormat,
+			filesystem: dmgFilesystem,
 			window: {
 				size: {
 					width: 660,
-					height: 400
-				}
+					height: 400,
+				},
 			},
 			contents: [
 				{
 					x: 180,
 					y: 170,
 					type: 'file',
-					path: appPath
+					path: appPath,
 				},
 				{
 					x: 480,
 					y: 170,
 					type: 'link',
-					path: '/Applications'
-				}
-			]
-		}
+					path: '/Applications',
+				},
+			],
+		},
 	});
 
 	ee.on('progress', info => {
@@ -125,29 +158,42 @@ async function init() {
 
 	ee.on('finish', async () => {
 		try {
-			ora.text = 'Replacing DMG icon';
-			// `seticon`` is a native tool to change files icons (Source: https://github.com/sveinbjornt/osxiconutils)
-			await execa(path.join(__dirname, 'seticon'), [composedIconPath, dmgPath]);
+			ora.text = 'Adding Software License Agreement if needed';
+			await addLicenseAgreementIfNeeded(dmgPath, dmgFormat);
+
+			if (hasAppIcon) {
+				ora.text = 'Replacing DMG icon';
+				// `seticon`` is a native tool to change files icons (Source: https://github.com/sveinbjornt/osxiconutils)
+				await execa(path.join(__dirname, 'seticon'), [composedIconPath, dmgPath]);
+			}
 
 			ora.text = 'Code signing DMG';
 			let identity;
-			const {stdout} = await execa('security', ['find-identity', '-v', '-p', 'codesigning']);
+			const {stdout} = await execa('/usr/bin/security', ['find-identity', '-v', '-p', 'codesigning']);
 			if (cli.flags.identity && stdout.includes(`"${cli.flags.identity}"`)) {
 				identity = cli.flags.identity;
 			} else if (!cli.flags.identity && stdout.includes('Developer ID Application:')) {
 				identity = 'Developer ID Application';
 			} else if (!cli.flags.identity && stdout.includes('Mac Developer:')) {
 				identity = 'Mac Developer';
+			} else if (!cli.flags.identity && stdout.includes('Apple Development:')) {
+				identity = 'Apple Development';
 			}
 
 			if (!identity) {
-				const error = new Error();
+				const error = new Error(); // eslint-disable-line unicorn/error-message
 				error.stderr = 'No suitable code signing identity found';
 				throw error;
 			}
 
-			await execa('codesign', ['--sign', identity, dmgPath]);
-			const {stderr} = await execa('codesign', [dmgPath, '--display', '--verbose=2']);
+			try {
+				await execa('/usr/bin/codesign', ['--sign', identity, dmgPath]);
+			} catch (error) {
+				ora.fail(`Code signing failed. The DMG is fine, just not code signed.\n${error.stderr?.trim() ?? error}`);
+				process.exit(2);
+			}
+
+			const {stderr} = await execa('/usr/bin/codesign', [dmgPath, '--display', '--verbose=2']);
 
 			const match = /^Authority=(.*)$/m.exec(stderr);
 			if (!match) {
@@ -156,9 +202,9 @@ async function init() {
 			}
 
 			ora.info(`Code signing identity: ${match[1]}`).start();
-			ora.succeed('DMG created');
+			ora.succeed(`Created “${dmgFilename}”`);
 		} catch (error) {
-			ora.fail(`Code signing failed. The DMG is fine, just not code signed.\n${error.stderr.trim()}`);
+			ora.fail(`${error.stderr?.trim() ?? error}`);
 			process.exit(2);
 		}
 	});
@@ -169,7 +215,9 @@ async function init() {
 	});
 }
 
-init().catch(error => {
-	ora.fail(error);
+try {
+	await init();
+} catch (error) {
+	ora.fail((error && error.stack) || error);
 	process.exit(1);
-});
+}
